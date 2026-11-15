@@ -84,12 +84,18 @@ def ordered(d):
     return {k: d[k] for k in FIELDS if k in d and not (k == "check" and d[k] is None)}
 
 
-def write_fact(path, d):
+def sealed(d):
+    """(the fact sealed, its file's bytes)."""
     d = ordered(d)
     d["seal"] = seal_of(d)
+    return d, (json.dumps(d, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def write_fact(path, d):
+    d, data = sealed(d)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_bytes((json.dumps(d, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    tmp.write_bytes(data)
     os.replace(tmp, path)
     return d
 
@@ -760,6 +766,50 @@ def cmd_retire(st, a):
     d["status"] = "retired"
     st.save(d)
     print(f"{a.key}: retired")
+    return 0
+
+
+def cmd_reseal(st, a):
+    """For tools that rewrite fact files on purpose (a redacted export): new
+    seals, and with --sources the current hashes of active facts' files.
+    Adds no history, confirms or flags; rev, by and at stay."""
+    facts, bad = {}, []
+    for key in st.keys():
+        name = f"{STORE.as_posix()}/{key}.json"
+        try:
+            d = json.loads(st.path(key).read_text(encoding="utf-8"))
+        except ValueError:
+            bad.append(f"{name} isn't valid JSON")
+            continue
+        if not isinstance(d, dict) or d.get("key") != key:
+            bad.append(f"{name} holds key {d.get('key') if isinstance(d, dict) else None!r}")
+            continue
+        facts[key] = d
+    if bad:
+        raise Refused("nothing written: " + "; ".join(bad))
+    written = broken = hashes = touched = 0
+    kept = []
+    for key, d in facts.items():
+        broken += d.get("seal") != seal_of(d)
+        if a.sources and d.get("status") == "active":
+            new, changed = [], 0
+            for s in d.get("sources") or []:
+                if "path" in s:
+                    h, problem = st.source_hash(s)
+                    if problem:
+                        kept.append(f"kept old hash: {key}: {problem}: {describe_source(s)}")
+                    elif h != s.get("sha256"):
+                        s, changed = s | {"sha256": h}, changed + 1
+                new.append(s)
+            if changed:
+                d["sources"], hashes, touched = new, hashes + changed, touched + 1
+        if sealed(d)[1] != st.path(key).read_bytes():
+            write_fact(st.path(key), d)
+            written += 1
+    line = f"resealed {written} of {len(facts)} facts ({broken} had a bad seal)"
+    print(line + (f"; updated {hashes} source hashes in {touched} facts" if a.sources else ""))
+    for k in kept:
+        print(k)
     return 0
 
 
@@ -1505,6 +1555,11 @@ def parser():
     du.add_argument("--swept", metavar="AREA", help="record that AREA was just swept")
     du.set_defaults(run=cmd_due)
 
+    rs = sub.add_parser("reseal", help="re-seal fact files a tool rewrote on purpose (not for sessions)")
+    rs.add_argument("--sources", action="store_true",
+                    help="also record active facts' file sources as they are now")
+    rs.set_defaults(run=cmd_reseal)
+
     r = sub.add_parser("render", help="print STATUS.md")
     r.set_defaults(run=cmd_render)
 
@@ -1522,7 +1577,7 @@ def parser():
     return p
 
 
-WRITING = {"set", "confirm", "flag", "retire", "init", "verify"}
+WRITING = {"set", "confirm", "flag", "retire", "init", "verify", "reseal"}
 
 
 def main(argv=None):

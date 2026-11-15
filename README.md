@@ -134,6 +134,19 @@ history, so branches that change different facts merge without conflicts.
 
 `KB_READONLY=1` in the environment makes kb change nothing on disk.
 
+## For tools that rewrite fact files
+
+A script that edits fact files on purpose, such as one that redacts text
+before publishing a copy of a repo, breaks their seals. Run `kb reseal` in
+the edited copy afterwards to seal them again. It rewrites them in kb's own
+layout (field order, 2-space indent, LF) and changes nothing else: no history
+entries, and the same `rev`, `by` and `at`. `kb reseal --sources` also
+records each active fact's file sources as they are now, so facts citing
+files the script edited don't read as suspect. Sources it can't find or hash
+(a missing file, a missing or ambiguous section) keep their old hash and are
+listed. Sessions shouldn't use it: it skips
+the re-check that `kb confirm` stands for, so SKILL.md doesn't mention it.
+
 ## After updating the plugin
 
 Claude Code keeps each plugin version in its own folder, and the pre-commit

@@ -1268,3 +1268,87 @@ def test_long_values(repo):
     out = ok(repo, "due")
     long = out[out.index("## Long (1)"):out.index("## Last swept")].splitlines()
     assert long[1:] == ["- a/x (401 chars)"]
+
+
+# --- amendment 5: kb reseal ---
+
+def store_bytes(repo):
+    d = repo / "docs" / "claims"
+    return {p.relative_to(d).as_posix(): p.read_bytes() for p in d.rglob("*.json")}
+
+
+@pytest.fixture
+def redacted(repo):
+    """K-reseal's store, after the export's edits: a/x hand-edited, f and
+    notes.md#B changed, g deleted."""
+    write(repo, "notes.md", "# A\n\nalpha\n\n# B\n\nbeta\n")
+    git(repo, "add", "notes.md")
+    git(repo, "commit", "-qm", "notes")
+    ok(repo, "set", "a/x", "the secret is one", "--from", "f")
+    ok(repo, "set", "a/x", "the secret is in f", "--from", "f")
+    ok(repo, "set", "a/y", "beta is in B", "--from", "notes.md#B")
+    ok(repo, "set", "a/z", "built on a/x", "--from", "a/x")
+    ok(repo, "set", "a/m", "gee is in g", "--from", "g")
+    ok(repo, "set", "a/r", "gone", "--from", "f")
+    ok(repo, "retire", "a/r", "test")
+    before = fact(repo, "a/x")
+    p = repo / "docs/claims/a/x.json"
+    p.write_text(p.read_text(encoding="utf-8").replace("secret", "[redacted]"), encoding="utf-8")
+    write(repo, "f", "one, redacted\n")
+    write(repo, "notes.md", "# A\n\nalpha\n\n# B\n\nbeta, redacted\n")
+    (repo / "g").unlink()
+    return repo, before
+
+
+def test_reseal(redacted):
+    repo, before = redacted
+    assert kb(repo, "get", "a/x").returncode != 0  # bad seal
+    out = ok(repo, "reseal")
+    assert "resealed 1 of 5 facts (1 had a bad seal)" in out
+    d = fact(repo, "a/x")
+    assert d["value"] == "the [redacted] is in f"
+    assert [h["value"] for h in d["history"]] == ["the [redacted] is one"]
+    for k in ("rev", "by", "at", "confirms", "flags", "sources"):
+        assert d.get(k) == before.get(k), k
+    for key in ("a/x", "a/y", "a/z", "a/m"):
+        assert state(repo, key).startswith("suspect"), key
+    out = ok(repo, "reseal", "--sources")
+    assert "updated 2 source hashes in 2 facts" in out
+    assert "kept old hash: a/m: missing: g" in out
+    for key in ("a/x", "a/y", "a/z"):
+        assert state(repo, key) == "clean", key
+    assert state(repo, "a/m").startswith("suspect")
+    assert fact(repo, "a/x")["confirms"] == before.get("confirms")
+    again = store_bytes(repo)
+    ok(repo, "reseal", "--sources")
+    assert store_bytes(repo) == again
+
+
+def test_reseal_refuses(redacted, monkeypatch):
+    repo, _ = redacted
+    bad = repo / "docs/claims/a/y.json"
+    good = bad.read_text(encoding="utf-8")
+    bad.write_text("<<<<<<< HEAD\n" + good, encoding="utf-8")
+    before = store_bytes(repo)
+    assert "a/y.json" in refused(repo, "reseal")
+    assert store_bytes(repo) == before
+    bad.write_text(good, encoding="utf-8")
+    moved = repo / "docs/claims/b/y.json"
+    moved.parent.mkdir()
+    moved.write_text(good, encoding="utf-8")
+    before = store_bytes(repo)
+    assert "b/y.json" in refused(repo, "reseal", "--sources")
+    assert store_bytes(repo) == before
+    moved.unlink()
+    monkeypatch.setenv("KB_READONLY", "1")
+    r = kb(repo, "reseal")
+    assert r.returncode == 1 and "KB_READONLY" in r.stderr
+    assert store_bytes(repo) == {k: v for k, v in before.items() if k != "b/y.json"}
+
+
+def test_reseal_commits(gated):
+    hand_edit(gated, "a/one", "first, redacted")
+    ok(gated, "reseal")
+    git(gated, "add", "-A")
+    p = commit(gated, msg="resealed")
+    assert p.returncode == 0, p.stderr
