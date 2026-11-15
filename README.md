@@ -48,8 +48,8 @@ which facts to pin.
   (kb runs check commands in its Git Bash). kb is tested only on Windows. On
   macOS or Linux everything except `--check` commands may work, but it hasn't
   been tried; `--check` refuses there, because it looks for `bash.exe`.
-- **Python 3** on PATH as `python` (tested with 3.13; kb uses only the
-  standard library).
+- **Python 3.11 or newer** on PATH as `python` (tested with 3.13; kb uses
+  only the standard library).
 - **Claude Code** with plugin support (tested with 2.1.317).
 
 ## Install
@@ -70,10 +70,38 @@ Then, in a session in each repo that should have a store:
 `kb init` creates `docs/claims/`, adds `/.claude/kb-stats/` to `.gitignore`,
 and installs a git pre-commit hook. If the repo already has a pre-commit hook,
 kb renames it `pre-commit.local` and runs it first; it still blocks commits
-when it fails.
+when it fails. `kb init --store <folder>` keeps the facts in another folder
+and records it in `.kb.toml` (see Settings).
 
-Repos without `docs/claims/` are untouched: the session-start hook prints
-nothing there.
+Repos without a store are untouched: the session-start hook prints nothing
+there.
+
+## Settings
+
+An optional `.kb.toml` at the repo root, committed with the repo, changes
+kb's defaults for everyone who works in it:
+
+```toml
+store = "notes/facts"   # where the facts live
+value_limit = 600       # this repo's facts need more room
+```
+
+| Key | Default | Effect |
+|---|---|---|
+| `store` | `"docs/claims"` | The folder holding the facts. Repo-relative, forward slashes, inside the repo and outside `.git`. `kb init --store` sets it. |
+| `readonly` | `false` | `true` makes kb change nothing on disk for everyone, like `KB_READONLY=1`: no writes, no check commands run, no statistics. Useful for an archive copy of a repo. |
+| `stats` | `true` | `false` turns off the local `events.csv` log. |
+| `value_limit` | `400` | Characters above which `kb set` warns and curating asks for a shorter fact. |
+| `overdue_hours` | `24` | How long a fact can stay suspect before STATUS says curating is due. |
+
+A file that isn't valid TOML, or a setting with the wrong type, makes every
+kb command refuse until it's fixed. An unknown key only gets a warning, so
+an older kb still works in a repo set up by a newer one.
+
+Some things are deliberately not settings: the STATUS size cap (it comes
+from Claude Code's hook limit), the default check timeout (each fact sets
+its own with `--timeout`), and anything about hashing or the seal (a fact
+file must mean the same thing in every repo).
 
 ## What the plugin contains
 
@@ -86,7 +114,7 @@ nothing there.
 - **A SessionStart hook** that prints STATUS (suspect facts, pinned facts,
   fact counts per area) into each new session.
 - **A pre-commit hook** (installed by `kb init`) that rejects hand edits to
-  `docs/claims/`. Only kb writes a valid seal, so a fact can't quietly drift
+  the store. Only kb writes a valid seal, so a fact can't quietly drift
   from its sources.
 
 ## How a fact turns suspect
@@ -107,13 +135,14 @@ nothing there.
   missing everywhere is shown as *unchecked*, never as clean.
 
 Status is computed every time, never stored. One fact is one JSON file at
-`docs/claims/<area>/<name>.json`, holding its value, its sources and its
+`<store>/<area>/<name>.json`, holding its value, its sources and its
 history, so branches that change different facts merge without conflicts.
 
 ## Limits
 
-- A value is meant to be one claim, at most 400 characters (`kb set` warns
-  above that). Longer detail goes in a file the fact cites.
+- A value is meant to be one claim, at most 400 characters unless
+  `.kb.toml` sets `value_limit` (`kb set` warns above that). Longer detail
+  goes in a file the fact cites.
 - Claude Code passes a hook at most 10,000 characters of output, so STATUS
   is kept under 9,500. The pre-commit hook refuses a commit whose pinned
   facts would push it over.
@@ -122,7 +151,8 @@ history, so branches that change different facts merge without conflicts.
 
 ## What kb writes, and how to remove it
 
-- `docs/claims/`: the facts. Commit them.
+- The store (`docs/claims/` by default): the facts. Commit them, and
+  `.kb.toml` if the repo has one.
 - `.claude/kb-stats/events.csv` in the main checkout: a local log of kb
   commands, which `kb stats` reads. Ignored by git. `kb stats` also reads
   this repo's Claude Code transcripts under `~/.claude/projects/` to count

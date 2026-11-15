@@ -2,7 +2,8 @@
 
     python -I kb.py <command> ...      (how it works: README.md)
 
-One sealed JSON file per fact at docs/claims/<key>.json, holding the current
+One sealed JSON file per fact at <store>/<key>.json (docs/claims unless
+.kb.toml names another folder), holding the current
 value, its sources (file hashes and other facts' revs) and its history.
 Status (clean / suspect / unchecked) is computed each time, never stored.
 """
@@ -17,8 +18,9 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 STORE = Path("docs") / "claims"
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@-]*(/[a-z0-9][a-z0-9._@-]*)+")
@@ -41,9 +43,84 @@ class BadSeal(Exception):
 
 # --- repo and time ---
 
-def readonly():
-    """KB_READONLY set (and not "0"): kb changes nothing on disk."""
+def env_readonly():
     return os.environ.get("KB_READONLY", "") not in ("", "0")
+
+
+def readonly():
+    """KB_READONLY set (and not "0"), or `readonly = true` in .kb.toml: kb
+    changes nothing on disk."""
+    return env_readonly() or SETTINGS["readonly"]
+
+
+# --- the repo's settings (.kb.toml) ---
+
+SETTINGS_FILE = ".kb.toml"
+DEFAULTS = {"store": "docs/claims", "readonly": False, "stats": True,
+            "value_limit": 400, "overdue_hours": 24}
+SETTINGS = dict(DEFAULTS)  # this run's; apply_settings sets them and the globals below
+
+
+def store_problem(s):
+    """Why `s` can't be a store folder, or None."""
+    if not isinstance(s, str) or not s.strip():
+        return "store must name a folder"
+    if any(c in s for c in '\\:"') or s.startswith("/"):
+        return f"store {s!r} must be a repo-relative folder with forward slashes"
+    parts = PurePosixPath(s).parts
+    if not parts or ".." in parts or parts[0].lower() == ".git":  # Windows ignores case
+        return f"store {s!r} must be a folder inside the repo, outside .git"
+    return None
+
+
+def setting_problem(k, v):
+    if k == "store":
+        return store_problem(v)
+    if k in ("readonly", "stats"):
+        return None if isinstance(v, bool) else f"{k} must be true or false"
+    if k == "value_limit":
+        ok = isinstance(v, int) and not isinstance(v, bool) and v >= 1
+        return None if ok else "value_limit must be a whole number of at least 1"
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+    return None if ok else "overdue_hours must be a number above 0"
+
+
+def read_settings(root):
+    """(settings, warnings) from root/.kb.toml. A bad file raises Refused."""
+    out, warnings = dict(DEFAULTS), []
+    f = root / SETTINGS_FILE
+    if not f.is_file():
+        return out, warnings
+    try:
+        d = tomllib.loads(f.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        raise Refused(f"{SETTINGS_FILE} isn't valid TOML: {e}")
+    for k, v in d.items():
+        if k not in DEFAULTS:
+            warnings.append(f"{SETTINGS_FILE}: unknown key {k}")
+        elif problem := setting_problem(k, v):
+            raise Refused(f"{SETTINGS_FILE}: {problem}")
+        else:
+            out[k] = v
+    return out, warnings
+
+
+def set_settings(s):
+    global STORE, LONG, OVERDUE
+    SETTINGS.clear()
+    SETTINGS.update(s)
+    STORE = Path(PurePosixPath(s["store"]))
+    LONG, OVERDUE = s["value_limit"], timedelta(hours=s["overdue_hours"])
+
+
+def apply_settings(root):
+    """Load root's settings into this run, defaults first (one process may run
+    kb more than once; main puts the defaults back at the end). Returns the
+    warnings."""
+    set_settings(DEFAULTS)
+    s, warnings = read_settings(root)
+    set_settings(s)
+    return warnings
 
 
 # Optional locks off: a read mustn't make git refresh (write) its index.
@@ -1130,7 +1207,10 @@ def cmd_hook_start(t0):
     st, row = None, {"command": "hook-start", "outcome": "ok"}
     try:
         top = project_top()
-        if top is None or not (top / STORE).is_dir():
+        if top is None:
+            return 0
+        apply_settings(top)  # warnings aren't shown at session start
+        if not (top / STORE).is_dir():
             return 0
         hook_session()
         st = Store(top)
@@ -1146,6 +1226,7 @@ def cmd_hook_start(t0):
         row.update(outcome="error", reason=one_line(e) or type(e).__name__)
     if st is not None:
         record(st, [row | {"seconds": round(time.perf_counter() - t0, 3)}])
+    set_settings(DEFAULTS)
     return 0
 
 
@@ -1155,7 +1236,7 @@ STATS_IGNORE = "/.claude/kb-stats/"
 HOOK_MARK = "# kb pre-commit (installed by kb init)"
 HOOK = """#!/bin/sh
 {mark}: runs the repo's own hook
-# (pre-commit.local) first, then checks the staged facts in docs/claims/.
+# (pre-commit.local) first, then checks the staged facts in the store.
 hooks=$(dirname "$0")
 if [ -f "$hooks/pre-commit.local" ]; then
   "$hooks/pre-commit.local" "$@" || exit $?
@@ -1172,7 +1253,43 @@ def git_bytes(root, *args, input=None):
     return p.stdout
 
 
+STORE_LINE = re.compile(r"""^[ \t]*(store|"store"|'store')[ \t]*=.*$""", re.M)
+TABLE_LINE = re.compile(r"^[ \t]*\[", re.M)
+
+
+def settings_with_store(text, folder):
+    """.kb.toml's text with its top-level store line set to `folder` (added
+    at the top when there's none, so it can't land inside a [table]), the
+    rest kept."""
+    line = f"store = {json.dumps(folder)}"
+    table = TABLE_LINE.search(text)
+    top = text[:table.start()] if table else text
+    if STORE_LINE.search(top):
+        return STORE_LINE.sub(lambda m: line, top, count=1) + text[len(top):]
+    return line + "\n" + text
+
+
 def cmd_init(st, a):
+    new_settings = None
+    if a.store is not None:
+        if problem := store_problem(a.store):
+            raise Refused(problem)
+        folder = PurePosixPath(a.store).as_posix()
+        cur = STORE.as_posix()
+        if folder != cur and st.keys():
+            raise Refused(f"{cur}/ holds facts; git mv {cur} {folder} first, "
+                          f"then run kb init --store {folder} again")
+        f = st.root / SETTINGS_FILE
+        old = f.read_text(encoding="utf-8") if f.is_file() else ""
+        text = settings_with_store(old, folder)
+        try:
+            ok = tomllib.loads(text).get("store") == folder
+        except tomllib.TOMLDecodeError:
+            ok = False
+        if not ok:
+            raise Refused(f"couldn't set store in {SETTINGS_FILE}; set store = {json.dumps(folder)} "
+                          "there by hand, then run kb init")
+        new_settings = (f, old, text, folder)
     d = git(st.root, "rev-parse", "--git-path", "hooks")  # honours core.hooksPath and worktrees
     hooks = (st.root / d).resolve()
     hook, local = hooks / "pre-commit", hooks / "pre-commit.local"
@@ -1180,6 +1297,12 @@ def cmd_init(st, a):
     current = hook.read_text(encoding="utf-8", errors="replace") if hook.exists() else None
     if current is not None and HOOK_MARK not in current and local.exists():
         raise Refused(f"both {hook.name} and {local.name} exist in {hooks}; merge them by hand, then run kb init")
+    if new_settings:
+        f, old, text, folder = new_settings
+        if text != old:
+            f.write_bytes(text.encode("utf-8"))
+            print(f"set store = {json.dumps(folder)} in {SETTINGS_FILE}")
+        set_settings(SETTINGS | {"store": folder})
     keep = st.root / STORE / ".gitkeep"
     if not keep.exists():
         keep.parent.mkdir(parents=True, exist_ok=True)
@@ -1205,7 +1328,7 @@ def cmd_init(st, a):
 
 
 def staged_blobs(root):
-    """{repo path: bytes} of every resolved docs/claims/*.json in the index
+    """{repo path: bytes} of every resolved <store>/*.json in the index
     (GIT_INDEX_FILE, as git sets it for a pathspec commit, is honoured)."""
     entries = []
     for rec in git_bytes(root, "ls-files", "-s", "-z", "--", STORE.as_posix()).split(b"\0"):
@@ -1282,7 +1405,7 @@ def record(st, rows):
     can't be written goes to errors.log if that can be written, else nowhere."""
     d = None
     try:
-        if readonly() or not (st.root / STORE).is_dir():
+        if readonly() or not SETTINGS["stats"] or not (st.root / STORE).is_dir():
             return
         d = stats_dir(st)
         here = st.root.resolve() == st.main_root().resolve()
@@ -1450,6 +1573,8 @@ def tally(rows, field):
 
 
 def events_report(st, since):
+    if not SETTINGS["stats"]:
+        return [f"Events: off ({SETTINGS_FILE} sets stats = false)."]
     f = stats_dir(st) / "events.csv"
     try:
         with open(f, encoding="utf-8", newline="") as fh:
@@ -1563,7 +1688,9 @@ def parser():
     r = sub.add_parser("render", help="print STATUS.md")
     r.set_defaults(run=cmd_render)
 
-    i = sub.add_parser("init", help="turn the store on in this repo (docs/claims, pre-commit hook)")
+    i = sub.add_parser("init", help="turn the store on in this repo (store folder, pre-commit hook)")
+    i.add_argument("--store", metavar="FOLDER",
+                   help=f"keep the facts in FOLDER (default docs/claims), recorded in {SETTINGS_FILE}")
     i.set_defaults(run=cmd_init)
 
     c = sub.add_parser("precommit", help="check the staged facts (run by the pre-commit hook)")
@@ -1592,8 +1719,12 @@ def main(argv=None):
     st, outcome, reason = None, "error", ""
     try:
         st = Store(repo_root())
-        if readonly() and a.command in WRITING:
+        for w in apply_settings(st.root):
+            print(f"kb: warning: {w}", file=sys.stderr)
+        if env_readonly() and a.command in WRITING:
             raise Refused(f"KB_READONLY is set; {a.command} writes")
+        if readonly() and a.command in WRITING:
+            raise Refused(f"{SETTINGS_FILE} sets readonly = true; {a.command} writes")
         rc = a.run(st, a)
         outcome = "ok"
         return rc
@@ -1619,6 +1750,7 @@ def main(argv=None):
             row["reason"] = one_line(row["reason"])[:300]
             row["seconds"] = round(time.perf_counter() - t0, 3)
             record(st, st.events + [row])
+        set_settings(DEFAULTS)
 
 
 if __name__ == "__main__":

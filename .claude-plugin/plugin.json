@@ -1,6 +1,6 @@
 {
   "name": "kb",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A claims store for Claude Code: one sealed file per fact, marked suspect when its sources change, shown to every new session.",
   "author": { "name": "Mainzu" },
   "license": "MIT",

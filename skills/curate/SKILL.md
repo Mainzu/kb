@@ -1,6 +1,6 @@
 ---
 name: curate
-description: Keep a repo's kb claims store current and readable - fix facts that have been suspect for over a day, merge duplicates, split or shorten facts. Use when STATUS shows "Curating due", or when the owner asks to curate.
+description: Keep a repo's kb claims store current and readable - fix facts that have been suspect past the overdue time, merge duplicates, split or shorten facts. Use when STATUS shows "Curating due", or when the owner asks to curate.
 argument-hint: "[areas or keys]"
 ---
 
@@ -40,7 +40,8 @@ it; don't confirm it.
      "merged into <key>", and re-point facts that cite it.
    - One fact holds several claims: split it into keys of their own, then
      re-set or retire the original.
-   - A value over 400 characters (`kb due` lists them under Long) or
+   - A value over 400 characters, or the `value_limit` `.kb.toml` sets
+     (`kb due` lists them under Long), or
      wordier than it needs to be: shorten it. Where a short summary can't
      hold it, move the detail to a file in the repo and cite that file (or
      its `#section`) from the fact.
@@ -59,7 +60,8 @@ it; don't confirm it.
 - Never edit raw records (results, decisions log, research docs).
 - Never make a fact sound surer than its sources.
 - Never take over a fact that isn't overdue, unless the owner asked:
-  its owner gets the first day.
+  its owner keeps it until the overdue time (a day unless `.kb.toml` sets
+  `overdue_hours`).
 
 ## Report
 

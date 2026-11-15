@@ -592,17 +592,17 @@ def test_verify(checked):
 # --- step 6: lookup and render ---
 
 def test_find(repo):
-    ok(repo, "set", "net/product", "The 10-29 Net plays as the product", "--from", "f")
-    ok(repo, "set", "net/old", "burst8hp2 was the product net", "--from", "f")
-    ok(repo, "set", "net/old", "burst8hp2 is retired from the ladder", "--from", "f", "--note", "ladder era")
-    out = ok(repo, "find", "PRODUCT", "net")  # every word, any case, key counts
-    assert out.splitlines() == ["net/product [clean] The 10-29 Net plays as the product"]
-    assert "net/old" in ok(repo, "find", "ladder", "era")  # the note counts
-    assert ok(repo, "find", "product", "burst8hp2").strip() == "no facts match"  # old value: history
-    out = ok(repo, "find", "product", "burst8hp2", "--all")
-    assert "net/old [rev 1, until" in out and "burst8hp2 was the product net" in out
+    ok(repo, "set", "app/release", "Build 10-29 ships as the release", "--from", "f")
+    ok(repo, "set", "app/old", "build7 was the release app", "--from", "f")
+    ok(repo, "set", "app/old", "build7 is retired from the beta", "--from", "f", "--note", "beta era")
+    out = ok(repo, "find", "RELEASE", "app")  # every word, any case, key counts
+    assert out.splitlines() == ["app/release [clean] Build 10-29 ships as the release"]
+    assert "app/old" in ok(repo, "find", "beta", "era")  # the note counts
+    assert ok(repo, "find", "release", "build7").strip() == "no facts match"  # old value: history
+    out = ok(repo, "find", "release", "build7", "--all")
+    assert "app/old [rev 1, until" in out and "build7 was the release app" in out
     write(repo, "f", "changed\n")
-    assert "net/product [suspect]" in ok(repo, "find", "10-29")
+    assert "app/release [suspect]" in ok(repo, "find", "10-29")
 
 
 def bulk(repo, areas, per_area, value="v", prefix="area", **fields):
@@ -1095,9 +1095,9 @@ def test_stats_events(repo, projects):
         {"at": "2026-11-02T10:00:00+07:00", "command": "hook-start", "outcome": "ok", "seconds": "0.3",
          "facts": "5", "suspect": "1", "unchecked": "0", "lines": "20"},
         {"at": "2026-11-02T11:00:00+07:00", "command": "find", "outcome": "ok", "hits": "0",
-         "words": "product net"},
+         "words": "release app"},
         {"at": "2026-11-02T11:01:00+07:00", "command": "find", "outcome": "ok", "hits": "0",
-         "words": "product net"},
+         "words": "release app"},
         {"at": "2026-11-02T11:02:00+07:00", "command": "set", "outcome": "refused",
          "reason": "a fact needs --from <files or facts>, or --owner"},
         {"at": "2026-11-02T11:03:00+07:00", "command": "check-run", "outcome": "timeout", "seconds": "10.2"},
@@ -1110,7 +1110,7 @@ def test_stats_events(repo, projects):
         for r in rows:
             w.writerow({"schema": KBMOD.EVENT_SCHEMA} | r)
     out = ok(repo, "stats")
-    assert '"product net" x2' in out, out
+    assert '"release app" x2' in out, out
     assert "median 0.6 s, slowest 0.9 s" in out, out
     assert "suspect 1 -> 3, unchecked 0 -> 1" in out, out
     assert "timeout 1" in out and "10.2 s" in out, out
@@ -1352,3 +1352,130 @@ def test_reseal_commits(gated):
     git(gated, "add", "-A")
     p = commit(gated, msg="resealed")
     assert p.returncode == 0, p.stderr
+
+
+# --- amendment 6: .kb.toml ---
+
+def settings(repo, text):
+    write(repo, ".kb.toml", text)
+
+
+def written(repo):
+    """snapshot() without kb's statistics, which every command adds to."""
+    return {k: v for k, v in snapshot(repo).items() if not k.startswith(".claude/kb-stats/")}
+
+
+def test_store_folder(repo, no_project_dir):
+    """K-store-folder."""
+    ok(repo, "init", "--store", "notes/facts")
+    assert (repo / ".kb.toml").read_text(encoding="utf-8") == 'store = "notes/facts"\n'
+    assert (repo / "notes/facts/.gitkeep").exists() and not (repo / "docs/claims").exists()
+    ok(repo, "set", "a/x", "one is in f", "--from", "f")
+    assert (repo / "notes/facts/a/x.json").exists() and not (repo / "docs/claims").exists()
+    assert "one is in f" in ok(repo, "get", "a/x") and "a/x" in ok(repo, "find", "one")
+    assert "1 facts: 1 clean" in ok(repo, "check")
+    p = hook_start(repo)
+    assert p.returncode == 0 and p.stdout.startswith("# STATUS"), p.stdout + p.stderr
+    git(repo, "add", "-A")
+    assert commit(repo, msg="facts").returncode == 0
+    f = repo / "notes/facts/a/x.json"
+    f.write_text(f.read_text(encoding="utf-8").replace("one is", "two is"), encoding="utf-8")
+    git(repo, "add", "-A")
+    p = commit(repo, msg="hand edit")
+    assert p.returncode != 0 and "notes/facts/a/x.json" in p.stderr, p.stderr
+    assert "resealed 1 of 1 facts (1 had a bad seal)" in ok(repo, "reseal")
+    git(repo, "add", "-A")
+    assert commit(repo, msg="resealed").returncode == 0
+    before = written(repo)
+    ok(repo, "init")
+    ok(repo, "init", "--store", "notes/facts")
+    assert written(repo) == before
+
+
+def test_store_folder_keeps_other_settings(repo):
+    settings(repo, '# limits for this repo\nvalue_limit = 600\nstore = "old/place"\n')
+    ok(repo, "init", "--store", "notes/facts")
+    text = (repo / ".kb.toml").read_text(encoding="utf-8")
+    assert text == '# limits for this repo\nvalue_limit = 600\nstore = "notes/facts"\n', text
+
+
+def test_store_folder_outside_tables(repo):
+    """A store line goes at the top level, never into a [table]."""
+    settings(repo, '[future]\nx = 1\n')
+    ok(repo, "init", "--store", "notes/facts")
+    assert (repo / ".kb.toml").read_text(encoding="utf-8") == 'store = "notes/facts"\n[future]\nx = 1\n'
+    ok(repo, "set", "a/x", "v", "--owner")
+    assert (repo / "notes/facts/a/x.json").exists()
+    settings(repo, '"store" = "notes/facts"\n')  # a quoted key is replaced, not doubled
+    ok(repo, "init", "--store", "notes/facts")
+    assert (repo / ".kb.toml").read_text(encoding="utf-8") == 'store = "notes/facts"\n'
+
+
+def test_store_folder_refuses(repo):
+    """K-store-folder-refuse."""
+    for bad in ("../x", "C:/x", "/x", ".git/x", ".GIT/x", ""):
+        before = written(repo)
+        refused(repo, "init", "--store", bad)
+        assert written(repo) == before, bad
+    ok(repo, "init")
+    ok(repo, "set", "a/x", "v", "--from", "f")
+    before = written(repo)
+    assert "git mv" in refused(repo, "init", "--store", "other")
+    assert written(repo) == before
+
+
+def test_settings_readonly(repo, no_project_dir):
+    ok(repo, "set", "a/x", "one is in f", "--from", "f", "--check", "cat f", "--expect", "one")
+    write(repo, "f", "one\n\n")
+    settings(repo, "readonly = true\n")
+    before = snapshot(repo)  # statistics included: read-only writes none
+    for args in (["get", "a/x"], ["check"], ["render"]):
+        ok(repo, *args)
+    assert "readonly" in refused(repo, "set", "a/y", "v", "--from", "f")
+    assert snapshot(repo) == before
+
+
+def test_settings_stats_off(repo, no_project_dir):
+    settings(repo, "stats = false\n")
+    ok(repo, "init")
+    ok(repo, "set", "a/x", "v", "--from", "f")
+    ok(repo, "find", "nothing")
+    assert not (repo / ".claude/kb-stats/events.csv").exists()
+
+
+def test_settings_value_limit(repo):
+    settings(repo, "value_limit = 10\n")
+    r = kb(repo, "set", "a/x", "x" * 20, "--owner")
+    assert r.returncode == 0 and "is 20 characters, over 10" in r.stderr, r.stderr
+    assert "- a/x (20 chars)" in ok(repo, "due")
+
+
+def test_settings_overdue_hours(repo):
+    ok(repo, "set", "a/x", "v", "--from", "f")
+    write(repo, "f", "changed\n")
+    ok(repo, "check")
+    age(repo, "a/x", 2)
+    assert "## Overdue (0)" in ok(repo, "due")
+    settings(repo, "overdue_hours = 1\n")
+    assert "## Overdue (1)" in ok(repo, "due")
+
+
+def test_settings_bad(repo, no_project_dir):
+    """K-settings-bad."""
+    ok(repo, "init")
+    ok(repo, "set", "a/x", "v", "--from", "f")
+    git(repo, "add", "-A")
+    assert commit(repo, msg="facts").returncode == 0
+    for text in ("store = \n", 'value_limit = "x"\n', "overdue_hours = 0\n"):
+        settings(repo, text)
+        r = kb(repo, "get", "a/x")
+        assert r.returncode != 0 and ".kb.toml" in r.stderr, (text, r.stderr)
+        write(repo, "g", text)
+        git(repo, "add", "-A")
+        p = commit(repo, msg="bad settings")
+        assert p.returncode != 0 and ".kb.toml" in p.stderr, (text, p.stderr)
+        p = hook_start(repo)
+        assert p.returncode == 0 and p.stdout.startswith("kb: ") and p.stdout.count("\n") == 1, p.stdout
+    settings(repo, "colour = 1\n")
+    r = kb(repo, "get", "a/x")
+    assert r.returncode == 0 and "kb: warning: .kb.toml: unknown key colour" in r.stderr, r.stderr
