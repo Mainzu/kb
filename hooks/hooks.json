@@ -1,0 +1,16 @@
+{
+  "description": "Prints the repo's current facts (STATUS) into each new session; does nothing in repos without docs/claims/.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I \"${CLAUDE_PLUGIN_ROOT}/skills/kb/kb.py\" hook-start",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
