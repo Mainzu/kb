@@ -8,8 +8,8 @@ fact built on it. A new session sees the current state of the store at start,
 looks a fact up instead of working it out again from files, and can tell a
 fact it can trust from one it has to re-check.
 
-It's the store I use in my own projects, packaged so others can try it.
-It's a personal project: issues are welcome, but I make no promises.
+kb is a personal project, published as is. Issues are welcome; support
+isn't guaranteed.
 
 ## What it looks like
 
@@ -39,18 +39,18 @@ Before working a fact out from files, look it up with the kb skill, and record w
 how 1
 ```
 
-Claude is the one who runs these commands; you mostly read STATUS and decide
-what to pin.
+Claude runs these commands. The repo's owner mostly reads STATUS and decides
+which facts to pin.
 
 ## Requirements
 
 - **Windows**, with [Git for Windows](https://git-scm.com/download/win)
-  (kb runs check commands in its Git Bash). That's the only system I've used
-  it on. On macOS or Linux everything except `--check` commands may work, but
-  I haven't tried; `--check` refuses there, because it looks for `bash.exe`.
-- **Python 3** on PATH as `python` (I use 3.13; kb uses only the standard
-  library).
-- **Claude Code** with plugin support (I use 2.1.317).
+  (kb runs check commands in its Git Bash). kb is tested only on Windows. On
+  macOS or Linux everything except `--check` commands may work, but it hasn't
+  been tried; `--check` refuses there, because it looks for `bash.exe`.
+- **Python 3** on PATH as `python` (tested with 3.13; kb uses only the
+  standard library).
+- **Claude Code** with plugin support (tested with 2.1.317).
 
 ## Install
 
@@ -75,10 +75,10 @@ when it fails.
 Repos without `docs/claims/` are untouched: the session-start hook prints
 nothing there.
 
-## What you get
+## What the plugin contains
 
 - **`/kb:kb`**, the skill Claude uses to look facts up and record them. It
-  loads on its own when a session needs a fact; you rarely type it. Its
+  loads on its own when a session needs a fact, so it rarely needs typing. Its
   [SKILL.md](skills/kb/SKILL.md) lists every command.
 - **`/kb:curate`**, which tidies the store: re-checks facts that have been
   suspect for over a day, merges duplicates, splits facts that hold several
@@ -126,7 +126,7 @@ history, so branches that change different facts merge without conflicts.
 - `.claude/kb-stats/events.csv` in the main checkout: a local log of kb
   commands, which `kb stats` reads. Ignored by git. `kb stats` also reads
   this repo's Claude Code transcripts under `~/.claude/projects/` to count
-  lookups. Nothing leaves your machine.
+  lookups. Nothing leaves the machine.
 - `kb-hash-cache.json` in the git folder: file hashes, so big sources aren't
   re-read every session. Safe to delete; it's rebuilt.
 - `.git/hooks/pre-commit`. To turn kb off in a repo, delete that file and
