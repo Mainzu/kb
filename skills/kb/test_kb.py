@@ -632,9 +632,9 @@ def test_render_layout(repo):
     out = ok(repo, "render", run=kb_proc)
     lines = out.splitlines()
     assert lines[0].startswith("# STATUS (kb render at ")
-    assert lines[1:4] == [KBMOD.HEADER[1], "", "## Suspect (2)"] and "kb skill" in lines[1]
+    assert lines[1:4] == [KBMOD.HEADER[1], "", "## Suspect (1) and unchecked (1)"] and "kb skill" in lines[1]
     assert "kb.py" not in out
-    sus = out[out.index("## Suspect (2)"):out.index("## Pinned")]
+    sus = out[out.index("## Suspect (1) and unchecked (1)"):out.index("## Pinned")]
     pin = out[out.index("## Pinned"):out.index("## Areas")]
     idx = out[out.index("## Areas (4 facts; kb list <area> names them)"):]
     assert "- p/sus: changed: f (was: a pinned fact that went stale)" in sus
@@ -664,7 +664,7 @@ def test_render_300_facts_fits(repo):
     bulk(repo, 12, 25)
     out = ok(repo, "render")
     assert len(out) <= KBMOD.CAP, len(out)
-    assert "## Suspect (0)" in out and "## Areas (300 facts;" in out
+    assert "## Suspect (0) and unchecked (0)" in out and "## Areas (300 facts;" in out
     assert "area-00 25 · area-01 25" in out and "fact-name" not in out
 
 
@@ -1479,3 +1479,386 @@ def test_settings_bad(repo, no_project_dir):
     settings(repo, "colour = 1\n")
     r = kb(repo, "get", "a/x")
     assert r.returncode == 0 and "kb: warning: .kb.toml: unknown key colour" in r.stderr, r.stderr
+
+
+# --- amendment 7: speed, STATUS counts, copy, move, big docs, check --json ---
+
+def test_fast_check(repo, monkeypatch):
+    """K-fast: one git check-ignore for every absent source, and each
+    Markdown file parsed once, however many facts cite it."""
+    write(repo, ".gitignore", "results/\n")
+    write(repo, "notes.md", "".join(f"# S{i}\n\nsection {i}\n\n" for i in range(40)))
+    data = (repo / "notes.md").read_bytes()
+    for i in range(40):
+        h, _ = KBMOD.hash_section(KBMOD.parse_headings(data), f"S{i}")
+        key = f"r/fact-{i:02d}"
+        KBMOD.write_fact(repo / "docs/claims" / (key + ".json"), {
+            "key": key, "rev": 1, "value": "v", "status": "active",
+            "sources": [{"path": f"results/r{i}.json", "sha256": "0" * 64},
+                        {"path": "notes.md", "anchor": f"S{i}", "sha256": h}],
+            "owner": False, "pinned": False, "note": None, "by": SESSION, "at": "t",
+            "confirms": [], "flags": [], "history": []})
+    calls, parses = [], []
+    real_run, real_parse = KBMOD.subprocess.run, KBMOD.parse_headings
+
+    def spy(args, *a, **k):
+        if args and args[0] == "git":
+            calls.append(list(args[1:3]))
+        return real_run(args, *a, **k)
+
+    def parse(data):
+        parses.append(1)
+        return real_parse(data)
+
+    monkeypatch.setattr(KBMOD.subprocess, "run", spy)
+    monkeypatch.setattr(KBMOD, "parse_headings", parse)
+    out = ok(repo, "check")
+    assert len(calls) <= 3, calls
+    assert len(parses) == 1, len(parses)
+    assert out.splitlines()[-1] == "40 facts: 0 clean, 0 suspect, 40 unchecked"
+    assert "r/fact-07 [unchecked]: not here (ignored): results/r7.json" in out
+
+
+def test_status_counts(repo):
+    """K-status-counts: STATUS counts suspect and unchecked apart, as kb check does."""
+    write(repo, ".gitignore", "results/\n")
+    (repo / "results").mkdir()
+    write(repo, "results/r.json", "{}\n")
+    ok(repo, "set", "a/sus", "v", "--from", "f")
+    ok(repo, "set", "a/un", "v", "--from", "results/r.json")
+    write(repo, "f", "changed\n")
+    (repo / "results/r.json").unlink()
+    assert "## Suspect (1) and unchecked (1)\n" in ok(repo, "render")
+    assert ok(repo, "check").splitlines()[-1].endswith("1 suspect, 1 unchecked")
+
+
+def test_copy_setting(repo):
+    """K-copy: in a copy, every absent source reads unchecked."""
+    write(repo, ".gitignore", "results/\n")
+    write(repo, "t.txt", "tracked\n")
+    git(repo, "add", "t.txt")
+    git(repo, "commit", "-qm", "t")
+    (repo / "results").mkdir()
+    write(repo, "results/r.json", "{}\n")
+    ok(repo, "set", "a/del", "v", "--from", "t.txt")
+    ok(repo, "set", "a/ign", "v", "--from", "results/r.json")
+    ok(repo, "set", "a/chg", "v", "--from", "f")
+    (repo / "t.txt").unlink()
+    (repo / "results/r.json").unlink()
+    write(repo, "f", "changed\n")
+    assert state(repo, "a/del").startswith("suspect")
+    assert state(repo, "a/ign").startswith("unchecked")
+    assert state(repo, "a/chg").startswith("suspect")
+    settings(repo, "copy = true\n")
+    assert state(repo, "a/del") == "unchecked: not in this copy: t.txt"
+    assert state(repo, "a/ign") == "unchecked: not in this copy: results/r.json"
+    assert state(repo, "a/chg").startswith("suspect")
+    out = ok(repo, "reseal", "--sources")
+    assert "kept old hash: a/del: not in this copy: t.txt" in out
+    assert "kept old hash: a/ign: not in this copy: results/r.json" in out
+
+
+@pytest.fixture
+def moving(repo):
+    """K-move's store."""
+    write(repo, "old.txt", "old\n")
+    write(repo, "notes.md", "# A\n\nalpha\n\n# B\n\nbeta\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "sources")
+    ok(repo, "set", "a/w", "old is in old.txt", "--from", "old.txt")
+    ok(repo, "confirm", "a/w", "read it")
+    ok(repo, "set", "a/x", "alpha", "--from", "notes.md#A")
+    ok(repo, "set", "a/y", "beta", "--from", "notes.md#B")
+    ok(repo, "set", "a/z", "both", "--from", "notes.md")
+    ok(repo, "set", "a/k", "built on a/w", "--from", "a/w")
+    ok(repo, "set", "a/r", "retired", "--from", "old.txt")
+    ok(repo, "retire", "a/r", "test")
+    return repo
+
+
+def test_move(moving):
+    repo = moving
+    before = {k: fact(repo, k) for k in ("a/w", "a/y", "a/z")}
+    retired = (repo / "docs/claims/a/r.json").read_bytes()
+    git(repo, "mv", "old.txt", "new.txt")
+    out = ok(repo, "move", "old.txt", "new.txt")
+    assert out.splitlines()[0] == "moved 1 sources in 1 facts"
+    d = fact(repo, "a/w")
+    assert [s["path"] for s in d["sources"]] == ["new.txt"]
+    for k in ("rev", "by", "at", "confirms", "flags", "history"):
+        assert d[k] == before["a/w"][k], k
+    assert state(repo, "a/w") == "clean" and state(repo, "a/k") == "clean"
+    assert (repo / "docs/claims/a/r.json").read_bytes() == retired
+
+    (repo / "docs").mkdir(exist_ok=True)
+    write(repo, "docs/n.md", "# A\n\nalpha\n\n# B\n\nbeta, edited\n")
+    out = ok(repo, "move", "notes.md", "docs/n.md")
+    assert out.splitlines()[0] == "moved 1 sources in 1 facts"
+    src = fact(repo, "a/x")["sources"][0]
+    assert (src["path"], src["anchor"]) == ("docs/n.md", "A")
+    assert "not moved: a/y: notes.md#B: content differs in docs/n.md" in out
+    assert "not moved: a/z: notes.md: content differs in docs/n.md" in out
+    assert fact(repo, "a/y") == before["a/y"] and fact(repo, "a/z") == before["a/z"]
+
+    write(repo, "arch.md", "# B\n\nbeta\n")
+    ok(repo, "move", "notes.md#B", "arch.md")
+    src = fact(repo, "a/y")["sources"][0]
+    assert (src["path"], src["anchor"]) == ("arch.md", "B")
+    assert state(repo, "a/y") == "clean"
+
+
+def test_move_refuses(moving, monkeypatch):
+    repo = moving
+    before = store_bytes(repo)
+    git(repo, "mv", "old.txt", "new.txt")
+    refused(repo, "move", "old.txt", "missing.txt")      # no new file
+    write(repo, "nobody.txt", "x\n")
+    refused(repo, "move", "nobody.txt", "new.txt")       # nothing cites it
+    write(repo, "n.md", "# A\n\nalpha\n")
+    assert "heading" in refused(repo, "move", "notes.md", "n.md#A")
+    monkeypatch.setenv("KB_READONLY", "1")
+    r = kb(repo, "move", "old.txt", "new.txt")
+    assert r.returncode == 1 and "KB_READONLY" in r.stderr
+    assert store_bytes(repo) == before
+
+
+def test_move_commits(gated):
+    git(gated, "mv", "f", "f2")
+    ok(gated, "move", "f", "f2")
+    git(gated, "add", "-A")
+    p = commit(gated, msg="moved")
+    assert p.returncode == 0, p.stderr
+
+
+A_OLD, A_NEW = "docs/specs/a.md", "docs/archive/specs/a.md"
+B_OLD, B_NEW = "docs/specs/b.md", "docs/archive/specs/b.md"
+
+
+@pytest.fixture
+def rewritten(repo):
+    """K-rewritten's store, committed, before the move."""
+    (repo / "docs/specs").mkdir(parents=True)
+    write(repo, A_OLD, f"# a\n\nsee {B_OLD}\n")
+    write(repo, B_OLD, "# b\n\nbee\n")
+    write(repo, "log.md", f"# L\n\nsee {A_OLD} and {B_OLD}\n\n# M\n\nsee {A_OLD}, more\n")
+    write(repo, "u.md", "unrelated\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "sources")
+    ok(repo, "set", "r/l", "L links a and b", "--from", "log.md#L")
+    ok(repo, "confirm", "r/l", "read it")
+    ok(repo, "set", "r/m", "M links a", "--from", "log.md#M")
+    ok(repo, "set", "r/a", "a links b", "--from", A_OLD)
+    ok(repo, "set", "r/k", "built on r/l", "--from", "r/l")
+    ok(repo, "set", "r/u", "unrelated", "--from", "u.md")
+    return repo
+
+
+def archive(repo, links=(A_OLD, B_OLD), extra=True):
+    """git mv both specs, rewrite the given links everywhere, and (extra) edit
+    other text in section M and u.md."""
+    (repo / "docs/archive/specs").mkdir(parents=True)
+    git(repo, "mv", A_OLD, A_NEW)
+    git(repo, "mv", B_OLD, B_NEW)
+    for name in ("log.md", A_NEW):
+        text = (repo / name).read_text(encoding="utf-8")
+        for old in links:
+            text = text.replace(old, old.replace("docs/", "docs/archive/"))
+        if extra and name == "log.md":
+            text = text.replace("more", "more, edited")
+        write(repo, name, text)
+    if extra:
+        write(repo, "u.md", "unrelated, edited\n")
+
+
+def test_move_rewritten(rewritten):
+    """K-rewritten: only sources that differ by the moved paths are re-hashed."""
+    repo = rewritten
+    archive(repo)
+    before = {k: fact(repo, k) for k in ("r/l", "r/m", "r/u")}
+    out = ok(repo, "move", A_OLD, A_NEW, B_OLD, B_NEW, "--rewritten")
+    lines = out.splitlines()
+    assert lines[0] == "moved 1 sources in 1 facts", out
+    assert lines[1] == "rehashed 2 sources in 2 facts (only moved paths differ)", out
+    d = fact(repo, "r/l")
+    for k in ("rev", "by", "at", "confirms", "flags", "history", "value"):
+        assert d[k] == before["r/l"][k], k
+    assert state(repo, "r/l") == "clean" and state(repo, "r/k") == "clean"
+    assert [s["path"] for s in fact(repo, "r/a")["sources"]] == [A_NEW]
+    assert state(repo, "r/a") == "clean"
+    for k in ("r/m", "r/u"):
+        assert fact(repo, k) == before[k] and state(repo, k).startswith("suspect"), k
+
+
+def test_move_rewritten_pairs_file(rewritten):
+    repo = rewritten
+    archive(repo)
+    before = {k: fact(repo, k) for k in ("r/m", "r/u")}
+    write(repo, "pairs.txt", f"{A_OLD}\t{A_NEW}\n\n{B_OLD}\t{B_NEW}\n")
+    out = ok(repo, "move", "--pairs", "pairs.txt", "--rewritten")
+    assert state(repo, "r/l") == "clean" and state(repo, "r/a") == "clean"
+    for k in ("r/m", "r/u"):
+        assert fact(repo, k) == before[k] and state(repo, k).startswith("suspect"), k
+    assert f"not cited: {B_OLD}" in out, out
+
+
+def test_move_rewritten_whole_paths_only(repo):
+    """An edit that only looks like the rewrite inside a longer path stays suspect."""
+    write(repo, "a.md", "a\n")
+    write(repo, "h.md", "# H\n\nsee lia.md and x/a.md\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "h")
+    ok(repo, "set", "a/h", "h", "--from", "h.md#H")
+    git(repo, "mv", "a.md", "b.md")
+    write(repo, "h.md", "# H\n\nsee lib.md and x/b.md\n")
+    ok(repo, "move", "a.md", "b.md", "--rewritten")
+    assert state(repo, "a/h").startswith("suspect")
+
+
+def test_move_without_rewritten(rewritten):
+    """Without --rewritten nothing is re-hashed; a moved file whose text
+    differs is re-pointed and stays suspect."""
+    repo = rewritten
+    archive(repo)
+    out = ok(repo, "move", A_OLD, A_NEW, B_OLD, B_NEW)
+    assert state(repo, "r/l").startswith("suspect")
+    assert f"moved, still suspect: r/a: {A_OLD}" in out, out
+    assert [s["path"] for s in fact(repo, "r/a")["sources"]] == [A_NEW]
+    assert f"changed: {A_NEW}" in ok(repo, "get", "r/a")
+
+
+def test_move_rewritten_needs_every_pair(rewritten):
+    repo = rewritten
+    archive(repo, links=(A_OLD,), extra=False)
+    ok(repo, "move", A_OLD, A_NEW, "--rewritten")
+    assert state(repo, "r/l") == "clean"
+
+
+def test_move_rewritten_missing_pair(rewritten):
+    repo = rewritten
+    archive(repo, extra=False)
+    ok(repo, "move", B_OLD, B_NEW, "--rewritten")
+    assert state(repo, "r/l").startswith("suspect")
+
+
+def test_move_pairs_refused(rewritten, monkeypatch):
+    repo = rewritten
+    archive(repo)
+    before = store_bytes(repo)
+    refused(repo, "move", A_OLD, A_NEW, B_OLD)                      # odd count
+    refused(repo, "move", A_OLD, A_NEW, B_OLD, "nowhere.md")        # second new missing
+    monkeypatch.setenv("KB_READONLY", "1")
+    r = kb(repo, "move", A_OLD, A_NEW, B_OLD, B_NEW, "--rewritten")
+    assert r.returncode == 1 and "KB_READONLY" in r.stderr
+    assert store_bytes(repo) == before
+
+
+def test_move_suspect_source(repo):
+    """K-move-suspect: an already-suspect source of a moved file is re-pointed."""
+    write(repo, "old.txt", "old\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "old")
+    ok(repo, "set", "a/s", "old", "--from", "old.txt")
+    h = fact(repo, "a/s")["sources"][0]["sha256"]
+    write(repo, "old.txt", "old, edited\n")
+    git(repo, "mv", "old.txt", "new.txt")
+    ok(repo, "move", "old.txt", "new.txt")
+    src = fact(repo, "a/s")["sources"][0]
+    assert (src["path"], src["sha256"]) == ("new.txt", h)
+    assert "changed: new.txt" in ok(repo, "get", "a/s")
+
+
+def test_move_rewritten_commits(gated):
+    write(gated, "h.md", "# H\n\nsee f\n")
+    git(gated, "add", "-A")
+    ok(gated, "set", "a/h", "h links f", "--from", "h.md#H")
+    git(gated, "add", "-A")
+    assert commit(gated, msg="h").returncode == 0
+    git(gated, "mv", "f", "f2")
+    write(gated, "h.md", "# H\n\nsee f2\n")
+    ok(gated, "move", "f", "f2", "--rewritten")
+    assert state(gated, "a/h") == "clean"
+    git(gated, "add", "-A")
+    p = commit(gated, msg="moved")
+    assert p.returncode == 0, p.stderr
+
+
+def test_big_doc_warning(repo):
+    """K-big-doc: a whole Markdown file with many headings as a source."""
+    write(repo, "doc10.md", "".join(f"## h{i}\n\ntext\n\n" for i in range(10)))
+    write(repo, "doc9.md", "".join(f"## h{i}\n\ntext\n\n" for i in range(9)))
+    r = kb(repo, "set", "a/x", "v", "--from", "doc10.md")
+    assert r.returncode == 0 and fact(repo, "a/x")["value"] == "v"
+    assert ("kb: warning: doc10.md is a whole Markdown file with 10 headings; any edit makes "
+            "a/x suspect; cite one section with doc10.md#<heading>") in r.stderr, r.stderr
+    for src in ("doc9.md", "doc10.md#h1"):
+        r = kb(repo, "set", "a/y", f"v from {src}", "--from", src)
+        assert r.returncode == 0 and "warning" not in r.stderr, (src, r.stderr)
+
+
+def test_check_json(repo):
+    """K-check-json."""
+    write(repo, ".gitignore", "results/\n")
+    (repo / "results").mkdir()
+    write(repo, "results/r.json", "{}\n")
+    ok(repo, "set", "a/chg", "v", "--from", "f")
+    ok(repo, "set", "a/fl", "v", "--from", "g")
+    ok(repo, "flag", "a/fl", "the code says otherwise")
+    ok(repo, "set", "a/un", "v", "--from", "results/r.json")
+    ok(repo, "set", "a/ok", "v", "--owner")
+    write(repo, "f", "changed\n")
+    (repo / "results/r.json").unlink()
+    text = ok(repo, "check").splitlines()[-1]
+    d = json.loads(ok(repo, "check", "--json"))
+    assert text == (f"{d['facts']} facts: {d['clean']} clean, {d['suspect']} suspect, "
+                    f"{d['unchecked']} unchecked")
+    items = {i["key"]: i for i in d["items"]}
+    assert list(items) == ["a/chg", "a/fl", "a/ok", "a/un"]
+    assert {"kind": "flagged", "detail": "the code says otherwise"} in items["a/fl"]["reasons"]
+    assert items["a/chg"] == {"key": "a/chg", "status": "suspect",
+                              "reasons": [{"kind": "changed", "detail": "f"}]}
+    assert items["a/un"]["reasons"] == [{"kind": "ignored", "detail": "results/r.json"}]
+    assert items["a/ok"] == {"key": "a/ok", "status": "clean", "reasons": []}
+
+
+def test_hook_start_without_store_resets_settings(repo, no_project_dir):
+    """K-review-fixes: the no-store return puts the defaults back."""
+    settings(repo, "value_limit = 7\n")
+    assert kb(repo, "hook-start").returncode == 0
+    assert KBMOD.SETTINGS == KBMOD.DEFAULTS and KBMOD.LONG == 400
+
+
+def test_bad_settings_write_no_events(repo, no_project_dir):
+    ok(repo, "init")
+    ok(repo, "set", "a/x", "v", "--from", "f")
+    (repo / ".claude/kb-stats/events.csv").unlink()
+    settings(repo, 'readonly = true\nvalue_limit = "x"\n')
+    assert ".kb.toml" in refused(repo, "get", "a/x")
+    assert not (repo / ".claude/kb-stats/events.csv").exists()
+
+
+def test_publish_vocabulary_whole_words():
+    script = KB.parents[3] / "scripts" / "publish-kb.py"
+    if not script.is_file():
+        pytest.skip("publish-kb.py lives only in the kit")
+    spec = importlib.util.spec_from_file_location("publish_kb", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.hits("we may relicense it", mod.PERSONAL) == []
+    for w in mod.VOCAB:  # read from the script: the words themselves mustn't be published
+        assert mod.hits(f"act 1 {w}s", mod.PERSONAL) == [w]
+        assert mod.hits(f"the {w.title()} says", mod.PERSONAL) == [w]
+
+
+def test_check_that_rewrites_its_section(repo):
+    """Review finding: a check that rewrites the section its fact cites gets
+    the new section's hash recorded, not the one read before it ran."""
+    write(repo, "notes.md", "# A\n\nv1\n")
+    ok(repo, "set", "a/x", "A says v3", "--from", "notes.md#A",
+       "--check", "printf '# A\n\nv3\n' > notes.md && echo ok", "--expect", "ok")
+    write(repo, "notes.md", "# A\n\nv2\n")
+    ok(repo, "check")
+    want, _ = KBMOD.hash_section(KBMOD.parse_headings((repo / "notes.md").read_bytes()), "A")
+    assert fact(repo, "a/x")["sources"][0]["sha256"] == want
+    n = len(fact(repo, "a/x")["confirms"])
+    ok(repo, "check")
+    assert len(fact(repo, "a/x")["confirms"]) == n

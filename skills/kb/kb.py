@@ -41,6 +41,16 @@ class BadSeal(Exception):
     pass
 
 
+class Reason(str):
+    """Why a fact isn't clean: its text, plus the kind and detail that
+    `kb check --json` prints."""
+
+    def __new__(cls, kind, detail, text=None):
+        r = super().__new__(cls, text if text is not None else f"{kind}: {detail}")
+        r.kind, r.detail = kind, detail
+        return r
+
+
 # --- repo and time ---
 
 def env_readonly():
@@ -57,7 +67,7 @@ def readonly():
 
 SETTINGS_FILE = ".kb.toml"
 DEFAULTS = {"store": "docs/claims", "readonly": False, "stats": True,
-            "value_limit": 400, "overdue_hours": 24}
+            "value_limit": 400, "overdue_hours": 24, "copy": False}
 SETTINGS = dict(DEFAULTS)  # this run's; apply_settings sets them and the globals below
 
 
@@ -76,7 +86,7 @@ def store_problem(s):
 def setting_problem(k, v):
     if k == "store":
         return store_problem(v)
-    if k in ("readonly", "stats"):
+    if k in ("readonly", "stats", "copy"):
         return None if isinstance(v, bool) else f"{k} must be true or false"
     if k == "value_limit":
         ok = isinstance(v, int) and not isinstance(v, bool) and v >= 1
@@ -257,11 +267,9 @@ def check_problem(outcome, out, check):
     return f'check gave "{out.splitlines()[0] if out else ""}"'
 
 
-def section_hash(data, anchor):
-    """(hash, None) of the Markdown section under heading `anchor`, or
-    (None, "section missing" / "section ambiguous"). The section runs from its
-    heading line to the line before the next heading of the same or higher
-    level; headings inside ``` or ~~~ fences don't count."""
+def parse_headings(data):
+    """(lines, headings) of a Markdown file: headings are (line index, level,
+    text); headings inside ``` or ~~~ fences don't count."""
     lines = data.splitlines(keepends=True)
     headings, fence = [], None
     for i, line in enumerate(lines):
@@ -275,6 +283,15 @@ def section_hash(data, anchor):
         m = HEADING_RE.fullmatch(body)
         if m:
             headings.append((i, len(m.group(1)), m.group(2).decode("utf-8", "replace")))
+    return lines, headings
+
+
+def section_text(parsed, anchor):
+    """(bytes, None) of the Markdown section under heading `anchor`, as its
+    hash covers it, or (None, "section missing" / "section ambiguous"), from
+    parse_headings' result. The section runs from its heading line to the
+    line before the next heading of the same or higher level."""
+    lines, headings = parsed
     hits = [h for h in headings if h[2] == anchor]
     if not hits:
         return None, "section missing"
@@ -284,7 +301,25 @@ def section_hash(data, anchor):
     end = next((i for i, lv, _ in headings if i > start and lv <= level), len(lines))
     # Trailing blank lines belong to whatever comes next: appending a section
     # after a blank line mustn't change the hash of the one above it.
-    return hashlib.sha256(b"".join(lines[start:end]).rstrip()).hexdigest(), None
+    return b"".join(lines[start:end]).rstrip(), None
+
+
+def hash_section(parsed, anchor):
+    """(hash, None) of a section, or (None, problem); see section_text."""
+    text, problem = section_text(parsed, anchor)
+    return (None, problem) if problem else (hashlib.sha256(text).hexdigest(), None)
+
+
+def unswap(text, swaps):
+    """text with each new path put back as its old one ((old, new) byte
+    pairs), longest new path first, in one pass. A path matches only as a
+    whole path: `lib.md` isn't the move a.md -> b.md, nor is `x/b.md`."""
+    if not swaps:
+        return text
+    back = {new: old for old, new in swaps}
+    pattern = b"|".join(re.escape(n) for n in sorted(back, key=len, reverse=True))
+    pattern = rb"(?<![\w./\\-])(?:" + pattern + rb")(?![\w/\\-]|\.\w)"
+    return re.sub(pattern, lambda m: back[m.group(0)], text)
 
 
 class Store:
@@ -297,6 +332,9 @@ class Store:
         self._facts = {}    # key -> raw dict, or the exception reading it raised
         self._status = {}   # key -> (state, reasons)
         self._ignored = {}  # repo-relative path -> bool
+        self._asked_absent = False  # every absent source's ignore rule fetched
+        self._located = {}  # repo-relative path -> Path or None, this run
+        self._parsed = {}   # Markdown file -> parse_headings(), this run
         self._cache = None  # absolute path -> [size, mtime_ns, sha256]
         self._cache_dirty = False
         self.check_notes = {}  # key -> why its check didn't re-confirm it, this run
@@ -326,13 +364,16 @@ class Store:
     def locate(self, rel):
         """Where a path source's file is: here, or for an ignored file missing
         here, the same path in the main checkout. None when it's in neither."""
-        p = self.root / rel
-        if p.is_file():
-            return p
-        main = self.main_root() / rel
-        if main.resolve() != p.resolve() and self.ignored(rel) and main.is_file():
-            return main
-        return None
+        if rel not in self._located:
+            p, found = self.root / rel, None
+            if p.is_file():
+                found = p
+            else:
+                main = self.main_root() / rel
+                if main.resolve() != p.resolve() and self.ignored(rel) and main.is_file():
+                    found = main
+            self._located[rel] = found
+        return self._located[rel]
 
     def cache_file(self):
         return self.common_dir() / "kb-hash-cache.json"
@@ -375,10 +416,25 @@ class Store:
         section problem."""
         p = self.locate(src["path"])
         if p is None:
+            if SETTINGS["copy"]:
+                return None, "not in this copy"
             return None, "ignored" if self.ignored(src["path"]) else "missing"
         if src.get("anchor"):
-            return section_hash(p.read_bytes(), src["anchor"])
+            if p not in self._parsed:  # many facts cite sections of one log
+                self._parsed[p] = parse_headings(p.read_bytes())
+            return hash_section(self._parsed[p], src["anchor"])
         return self.file_hash(p), None
+
+    def source_text(self, src):
+        """The bytes a path source's hash covers now, or None."""
+        p = self.locate(src["path"])
+        if p is None:
+            return None
+        if src.get("anchor"):
+            if p not in self._parsed:
+                self._parsed[p] = parse_headings(p.read_bytes())
+            return section_text(self._parsed[p], src["anchor"])[0]
+        return p.read_bytes()
 
     def at(self):
         """ISO time and short HEAD commit, the `at` of a write."""
@@ -415,11 +471,33 @@ class Store:
         return sorted(p.relative_to(d).with_suffix("").as_posix() for p in d.rglob("*.json"))
 
     def ignored(self, rel):
+        """Is `rel` ignored by git? The first question asks about every path
+        source in the store that isn't here too, in one git call (a process
+        start costs ~0.2 s on Windows, and a copy may lack hundreds)."""
         if rel not in self._ignored:
-            p = subprocess.run(["git", "check-ignore", "-q", "--", rel], cwd=self.root,
-                               capture_output=True, stdin=subprocess.DEVNULL,
-                               env=os.environ | GIT_ENV)
-            self._ignored[rel] = p.returncode == 0
+            ask = {rel}
+            if not self._asked_absent:
+                self._asked_absent = True
+                for key in self.keys():
+                    try:
+                        d = self.load(key, trust=False)
+                    except (NotFound, BadSeal):
+                        continue
+                    ask |= {s["path"] for s in d.get("sources") or []
+                            if "path" in s and not (self.root / s["path"]).is_file()}
+            ask = sorted(ask - set(self._ignored))
+            p = subprocess.run(["git", "check-ignore", "-z", "--stdin"], cwd=self.root,
+                               capture_output=True, env=os.environ | GIT_ENV,
+                               input=b"".join(a.encode("utf-8") + b"\0" for a in ask))
+            if p.returncode in (0, 1):  # 1: none ignored
+                hits = set(p.stdout.decode("utf-8", "replace").split("\0"))
+                self._ignored.update((a, a in hits) for a in ask)
+            else:  # a path git won't take (outside the repo?) fails the batch
+                for a in ask:
+                    q = subprocess.run(["git", "check-ignore", "-q", "--", a], cwd=self.root,
+                                       capture_output=True, stdin=subprocess.DEVNULL,
+                                       env=os.environ | GIT_ENV)
+                    self._ignored[a] = q.returncode == 0
         return self._ignored[rel]
 
     def depends_on(self, start, target, seen=None):
@@ -447,15 +525,16 @@ class Store:
             return self._status[key]
         active = active if active is not None else set()
         if key in active:
-            return "suspect", [f"cycle through {key}"]
+            return "suspect", [Reason("cycle", key, f"cycle through {key}")]
         active.add(key)
         try:
             res = self._status_of(self.load(key), active)
         except (NotFound, BadSeal) as e:
-            res = "suspect", [str(e)]
+            res = "suspect", [Reason("unreadable", str(e), str(e))]
         active.discard(key)
         if res[0] == "suspect" and key in self.check_notes:
-            res = res[0], res[1] + [self.check_notes[key]]
+            note = self.check_notes[key]
+            res = res[0], res[1] + [Reason("check", note, note)]
         self._status[key] = res
         return res
 
@@ -467,34 +546,36 @@ class Store:
             if "path" in s:
                 h, problem = self.source_hash(s)
                 if problem == "ignored":
-                    unchecked.append(f"not here (ignored): {s['path']}")
+                    unchecked.append(Reason("ignored", s["path"], f"not here (ignored): {s['path']}"))
+                elif problem == "not in this copy":
+                    unchecked.append(Reason(problem, s["path"]))
                 elif problem == "missing":
-                    suspect.append(f"missing: {s['path']}")
+                    suspect.append(Reason("missing", s["path"]))
                 elif problem:
-                    suspect.append(f"{problem}: {describe_source(s)}")
+                    suspect.append(Reason(problem, describe_source(s)))
                 elif h != s["sha256"]:
-                    suspect.append(f"changed: {describe_source(s)}")
+                    suspect.append(Reason("changed", describe_source(s)))
                 continue
             k = s["key"]
             try:
                 src = self.load(k)
             except NotFound:
-                suspect.append(f"source fact missing: {k}")
+                suspect.append(Reason("source fact missing", k))
                 continue
             except BadSeal:
-                suspect.append(f"source fact unreadable: {k}")
+                suspect.append(Reason("source fact unreadable", k))
                 continue
             if src["status"] == "retired":
-                suspect.append(f"source fact retired: {k}")
+                suspect.append(Reason("source fact retired", k))
             elif src["rev"] != s["rev"]:
-                suspect.append(f"source fact changed: {k}")
+                suspect.append(Reason("source fact changed", k))
             else:
                 state, _ = self.status(k, active)
                 if state == "suspect":
-                    suspect.append(f"source fact suspect: {k}")
+                    suspect.append(Reason("source fact suspect", k))
                 elif state == "unchecked":
-                    unchecked.append(f"source fact unchecked: {k}")
-        suspect += [f"flagged: {f['reason']}" for f in d.get("flags") or []]
+                    unchecked.append(Reason("source fact unchecked", k))
+        suspect += [Reason("flagged", f["reason"]) for f in d.get("flags") or []]
         if suspect:
             return "suspect", suspect + unchecked
         if unchecked:
@@ -564,6 +645,8 @@ class Store:
         """run_check, recorded as a check-run event."""
         t = time.perf_counter()
         outcome, out = run_check(self.root, check)
+        self._parsed.clear()  # the command may have rewritten source files
+        self._located.clear()
         self.events.append({"command": "check-run", "keys": key, "outcome": outcome,
                             "reason": "" if outcome == "match" else check_problem(outcome, out, check),
                             "seconds": round(time.perf_counter() - t, 3)})
@@ -601,18 +684,21 @@ class Store:
                               "confirm it first (bottom up)")
         return {"key": key, "rev": d["rev"]}
 
-    def path_source(self, arg):
-        path, _, anchor = arg.partition("#")
-        p = (Path.cwd() / path).resolve()
+    def rel_path(self, path):
+        """A path as given (relative to the current folder) as the repo-relative
+        path a source records."""
         try:
-            rel = p.relative_to(self.root.resolve()).as_posix()
+            return (Path.cwd() / path).resolve().relative_to(self.root.resolve()).as_posix()
         except ValueError:
             raise Refused(f"{path} is outside the repository")
-        src = {"path": rel}
+
+    def path_source(self, arg):
+        path, _, anchor = arg.partition("#")
+        src = {"path": self.rel_path(path)}
         if anchor:
             src["anchor"] = anchor
         h, problem = self.source_hash(src)
-        if problem in ("missing", "ignored"):
+        if problem in ABSENT:
             raise Refused(f"no such file or fact: {arg}")
         if problem:
             raise Refused(f"{problem}: {arg} (cite a heading that appears exactly once, "
@@ -628,13 +714,16 @@ class Store:
                 out.append(self.key_source(s["key"], clean=True))
                 continue
             h, problem = self.source_hash(s)
-            if problem in ("missing", "ignored"):
+            if problem in ABSENT:
                 raise Refused(f"source file {s['path']} isn't here; "
                               "re-set the fact with its new path")
             if problem:
                 raise Refused(f"{problem}: {describe_source(s)}; re-set the fact with its new heading")
             out.append(s | {"sha256": h})
         return out
+
+
+ABSENT = ("missing", "ignored", "not in this copy")  # source_hash's no-file problems
 
 
 def describe_source(s):
@@ -709,6 +798,7 @@ def cmd_set(st, a):
         old.setdefault("confirms", []).append({"by": by, "at": at, "note": a.note})
         st.save(old)
         print(f"{key}: confirmed (rev {old['rev']})")
+        big_doc_warnings(st, key, sources)
         return 0
 
     d = {"key": key, "rev": 1, "value": a.value, "status": "active", "sources": sources,
@@ -725,7 +815,22 @@ def cmd_set(st, a):
     if len(d["value"]) > LONG:
         print(f"kb: warning: {key} is {len(d['value'])} characters, over {LONG}; split it, "
               "or move the detail to a file the fact cites", file=sys.stderr)
+    big_doc_warnings(st, key, sources)
     return 0
+
+
+BIG_DOC = 10  # headings: a whole Markdown file this sectioned is better cited by section
+
+
+def big_doc_warnings(st, key, sources):
+    for s in sources:
+        if "path" not in s or s.get("anchor") or not s["path"].lower().endswith(".md"):
+            continue
+        p = st.locate(s["path"])
+        n = len(parse_headings(p.read_bytes())[1]) if p else 0
+        if n >= BIG_DOC:
+            print(f"kb: warning: {s['path']} is a whole Markdown file with {n} headings; any edit "
+                  f"makes {key} suspect; cite one section with {s['path']}#<heading>", file=sys.stderr)
 
 
 def cmd_get(st, a):
@@ -757,7 +862,7 @@ def cmd_get(st, a):
 def cmd_check(st, a):
     for key in st.in_order(st.keys()):
         st.auto_check(key)
-    counts, states = {"clean": 0, "suspect": 0, "unchecked": 0}, {}
+    counts, states, items = {"clean": 0, "suspect": 0, "unchecked": 0}, {}, []
     for key in st.keys():
         try:
             if st.load(key)["status"] != "active":
@@ -767,11 +872,18 @@ def cmd_check(st, a):
         state, reasons = st.status(key)
         counts[state] += 1
         states[key] = state
-        if state != "clean":
+        items.append({"key": key, "status": state, "reasons": [
+            {"kind": getattr(r, "kind", "other"), "detail": getattr(r, "detail", str(r))}
+            for r in reasons]})
+        if state != "clean" and not a.json:
             print(f"{key} [{state}]: {'; '.join(reasons)}")
     track(st, states)
     st.event.update(facts=sum(counts.values()), suspect=counts["suspect"],
                     unchecked=counts["unchecked"])
+    if a.json:
+        print(json.dumps({"facts": sum(counts.values()), **counts, "items": items},
+                         indent=1, ensure_ascii=False))
+        return 0
     print(f"{sum(counts.values())} facts: {counts['clean']} clean, "
           f"{counts['suspect']} suspect, {counts['unchecked']} unchecked")
     return 0
@@ -887,6 +999,111 @@ def cmd_reseal(st, a):
     print(line + (f"; updated {hashes} source hashes in {touched} facts" if a.sources else ""))
     for k in kept:
         print(k)
+    return 0
+
+
+def move_pairs(st, a):
+    """The moves asked for, as (old as given, old, heading, new); refused,
+    before anything is written, for a bad pair."""
+    paths = list(a.paths)
+    if a.pairs:
+        try:
+            text = Path(a.pairs).read_text(encoding="utf-8")
+        except OSError as e:
+            raise Refused(f"can't read {a.pairs}: {e}")
+        for line in text.splitlines():
+            if line.strip():
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    raise Refused(f"{a.pairs}: not <old path><tab><new path>: {line}")
+                paths += parts
+    if not paths or len(paths) % 2:
+        raise Refused("give the paths as pairs: <old path>[#heading] <new path> ...")
+    pairs = []
+    for given, new_arg in zip(paths[::2], paths[1::2]):
+        if "#" in new_arg:
+            raise Refused("the new place takes no heading: a section keeps its heading "
+                          "(its hash covers the heading line); give the new file only")
+        old_path, _, anchor = given.partition("#")
+        old, new = st.rel_path(old_path), st.rel_path(new_arg)
+        if not (st.root / new).is_file():
+            raise Refused(f"no such file: {new_arg}")
+        pairs.append((given, old, anchor, new))
+    return pairs
+
+
+def cmd_move(st, a):
+    """Files or sections moved word for word: re-point the path sources of
+    active facts that cite them, where the new place hashes as recorded (or,
+    for a moved file, still has the cited content, which keeps its old hash
+    and stays suspect). With --rewritten, links to the moved files were
+    rewritten too: a changed source whose text, with the old paths put back,
+    hashes as recorded gets its current hash. Adds no history or confirm;
+    rev, by and at stay."""
+    pairs = move_pairs(st, a)
+    swaps = [(old.encode(), new.encode()) for _, old, anchor, new in pairs if not anchor]
+    gone = {old for _, old, anchor, _ in pairs if not (st.root / old).is_file()}
+
+    def links_only(s):
+        """s's current text differs from what was recorded only by the moved paths."""
+        if not (a.rewritten and swaps):
+            return False
+        text = st.source_text(s)
+        return text is not None and hashlib.sha256(unswap(text, swaps)).hexdigest() == s["sha256"]
+
+    writes, lines, cited = [], [], set()
+    moved = rehashed = moved_facts = rehashed_facts = 0
+    for key in st.keys():
+        try:
+            d = st.load(key)
+        except (NotFound, BadSeal):
+            continue
+        if d["status"] != "active":
+            continue
+        sources, seen, n, r = [], set(), 0, 0
+        for s in d["sources"]:
+            pair = next((p for p in pairs if "path" in s and s["path"] == p[1]
+                         and (not p[2] or s.get("anchor") == p[2])), None)
+            if pair:
+                cited.add(pair[0])
+                t = s | {"path": pair[3]}
+                h, problem = st.source_hash(t)
+                if not problem and h == s["sha256"]:
+                    s, n = t, n + 1
+                elif not problem and links_only(t):
+                    s, n, r = t | {"sha256": h}, n + 1, r + 1
+                elif not problem and pair[1] in gone:
+                    lines.append(f"moved, still suspect: {key}: {describe_source(s)}")
+                    s, n = t, n + 1
+                else:
+                    why = f"{problem} in {pair[3]}" if problem else f"content differs in {pair[3]}"
+                    lines.append(f"not moved: {key}: {describe_source(s)}: {why}")
+            elif "path" in s and a.rewritten and swaps:
+                h, problem = st.source_hash(s)
+                if not problem and h != s["sha256"] and links_only(s):
+                    s, r = s | {"sha256": h}, r + 1
+            ident = (s.get("path"), s.get("anchor"), s.get("key"))
+            if ident not in seen:
+                seen.add(ident)
+                sources.append(s)
+        if n or r:
+            writes.append(d | {"sources": sources})
+            moved, rehashed = moved + n, rehashed + r
+            moved_facts, rehashed_facts = moved_facts + bool(n), rehashed_facts + bool(r)
+    if not cited and not a.rewritten:
+        raise Refused(f"no active fact cites {pairs[0][0]}" if len(pairs) == 1
+                      else "no active fact cites any of the old paths")
+    for d in writes:
+        st.save(d)
+    st.event["keys"] = ";".join(d["key"] for d in writes)
+    print(f"moved {moved} sources in {moved_facts} facts")
+    if a.rewritten:
+        print(f"rehashed {rehashed} sources in {rehashed_facts} facts (only moved paths differ)")
+    for line in lines:
+        print(line)
+    for given, *_ in pairs:
+        if given not in cited:
+            print(f"not cited: {given}")
     return 0
 
 
@@ -1042,11 +1259,11 @@ def due_line(n_overdue, n_hidden, n_long=0):
             "started this session for it, only on the facts your task touches.")
 
 
-def layout(st, due, shown, n_bad, more, pins, hidden, index, n_facts):
+def layout(st, due, shown, counts, more, pins, hidden, index, n_facts):
     lines = [line.format(commit=st.head()) for line in HEADER]
     if due:
         lines.insert(len(lines) - 1, due)  # before the header's blank line
-    lines += [f"## Suspect ({n_bad})"] + shown
+    lines += [f"## Suspect ({counts[0]}) and unchecked ({counts[1]})"] + shown
     if more:
         lines.append(f"... and {more} more: kb check")
     lines += ["## Pinned"] + pins
@@ -1071,22 +1288,23 @@ def render_text(st, cap=CAP):
     """STATUS. Header, due line and Areas always show; Pinned fits within the
     cap less SUSPECT_ROOM; Suspect takes the rest. Sets st.hidden_pins."""
     bad, pinned, index, n, st.states = render_parts(st)
+    nb = st.counts["suspect"], st.counts["unchecked"]
     track(st, st.states)
     od = len(st.overdue)
     st.hidden_pins = []
-    text = layout(st, due_line(od, 0, len(st.long)), bad, len(bad), 0, pinned, 0, index, n)
+    text = layout(st, due_line(od, 0, len(st.long)), bad, nb, 0, pinned, 0, index, n)
     if len(text) <= cap:
         return text
-    widest = layout(st, due_line(od, len(pinned), len(st.long)), [], len(bad), len(bad),
+    widest = layout(st, due_line(od, len(pinned), len(st.long)), [], nb, len(bad),
                     [], len(pinned), index, n)
     pins = take(pinned, cap - len(widest) - SUSPECT_ROOM)
     st.hidden_pins = pinned[len(pins):]
     hidden = len(st.hidden_pins)
     due = due_line(od, hidden, len(st.long))
-    rest = len(layout(st, due, [], len(bad), len(bad), pins, hidden, index, n))
+    rest = len(layout(st, due, [], nb, len(bad), pins, hidden, index, n))
     shown = take(bad, cap - rest)
     more = len(bad) - len(shown)
-    return layout(st, due, shown, len(bad), more, pins, hidden, index, n)
+    return layout(st, due, shown, nb, more, pins, hidden, index, n)
 
 
 def cmd_due(st, a):
@@ -1204,6 +1422,13 @@ def hook_session():
 def cmd_hook_start(t0):
     """The global SessionStart hook: print STATUS.md into a new session. Silent
     where there's no store; never fails the session."""
+    try:
+        return hook_start(t0)
+    finally:
+        set_settings(DEFAULTS)  # one process may run kb again (the tests do)
+
+
+def hook_start(t0):
     st, row = None, {"command": "hook-start", "outcome": "ok"}
     try:
         top = project_top()
@@ -1226,7 +1451,6 @@ def cmd_hook_start(t0):
         row.update(outcome="error", reason=one_line(e) or type(e).__name__)
     if st is not None:
         record(st, [row | {"seconds": round(time.perf_counter() - t0, 3)}])
-    set_settings(DEFAULTS)
     return 0
 
 
@@ -1646,6 +1870,7 @@ def parser():
     g.set_defaults(run=cmd_get)
 
     c = sub.add_parser("check", help="list every fact that isn't clean")
+    c.add_argument("--json", action="store_true", help="every active fact with its status, as JSON")
     c.set_defaults(run=cmd_check)
 
     v = sub.add_parser("verify", help="run facts' checks, suspect or not")
@@ -1666,6 +1891,13 @@ def parser():
     r.add_argument("key")
     r.add_argument("why", nargs="?", help="why (required)")
     r.set_defaults(run=cmd_retire)
+
+    m = sub.add_parser("move", help="a source file or section moved word for word: re-point the facts")
+    m.add_argument("paths", nargs="*", metavar="OLD_PATH[#HEADING] NEW_PATH")
+    m.add_argument("--pairs", metavar="FILE", help="one move per line: old path, tab, new path")
+    m.add_argument("--rewritten", action="store_true",
+                   help="links to the moved files were rewritten: re-hash sources that differ only by them")
+    m.set_defaults(run=cmd_move)
 
     f = sub.add_parser("find", help="facts whose key, value or note contain every word")
     f.add_argument("words", nargs="+", metavar="word")
@@ -1704,7 +1936,7 @@ def parser():
     return p
 
 
-WRITING = {"set", "confirm", "flag", "retire", "init", "verify", "reseal"}
+WRITING = {"set", "confirm", "flag", "retire", "init", "verify", "reseal", "move"}
 
 
 def main(argv=None):
@@ -1716,11 +1948,12 @@ def main(argv=None):
     t0 = time.perf_counter()
     if a.command == "hook-start":
         return cmd_hook_start(t0)
-    st, outcome, reason = None, "error", ""
+    st, outcome, reason, settings_read = None, "error", "", False
     try:
         st = Store(repo_root())
         for w in apply_settings(st.root):
             print(f"kb: warning: {w}", file=sys.stderr)
+        settings_read = True  # a refused .kb.toml may have meant stats or readonly off
         if env_readonly() and a.command in WRITING:
             raise Refused(f"KB_READONLY is set; {a.command} writes")
         if readonly() and a.command in WRITING:
@@ -1740,7 +1973,7 @@ def main(argv=None):
         reason = one_line(e) or type(e).__name__
         raise
     finally:
-        if st is not None:
+        if st is not None and settings_read:
             st.save_cache()
             keys = getattr(a, "key", None) or ";".join(getattr(a, "keys", None) or [])
             row = {"command": a.command, "keys": keys, "outcome": outcome, "reason": reason}

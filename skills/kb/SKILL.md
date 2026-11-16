@@ -31,6 +31,10 @@ and PowerShell alike.
 - `kb flag <key> "<why>"`: the code or a fresh measurement disagrees. Follow
   the code or measurement, say so, and flag the fact.
 - `kb retire <key> "<why>"`: no longer true and nothing replaces it.
+- `kb move <old path>[#heading] <new path>`: a source file or section moved
+  word for word; re-points the facts citing it (those whose content differs are listed).
+  Several pairs in one call; add `--rewritten` when links to the moved files
+  were rewritten too: sources that differ only by those links are re-hashed.
 - `kb set ... --check "<cmd>" --expect "<output>" [--timeout <s>]`: a command
   that re-confirms the fact on its own when a source changes. `kb verify`
   runs checks on demand.

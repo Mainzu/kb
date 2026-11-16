@@ -32,7 +32,7 @@ Every new session in that repo starts with this in its context:
 # STATUS (kb render at 8edae5b; generated, don't edit)
 Before working a fact out from files, look it up with the kb skill, and record what you learn there. Suspect and unchecked facts aren't current until re-checked.
 
-## Suspect (1)
+## Suspect (1) and unchecked (0)
 - how/parse: changed: calc.py (was: parse() strips whitespace and returns an int)
 ## Pinned
 ## Areas (1 facts; kb list <area> names them)
@@ -93,6 +93,7 @@ value_limit = 600       # this repo's facts need more room
 | `stats` | `true` | `false` turns off the local `events.csv` log. |
 | `value_limit` | `400` | Characters above which `kb set` warns and curating asks for a shorter fact. |
 | `overdue_hours` | `24` | How long a fact can stay suspect before STATUS says curating is due. |
+| `copy` | `false` | `true` for a partial copy of another repo, such as a public export: a source file missing here reads *unchecked* (`not in this copy`) whatever `.gitignore` says, so every absent source reads the same way. |
 
 A file that isn't valid TOML, or a setting with the wrong type, makes every
 kb command refuse until it's fixed. An unknown key only gets a warning, so
@@ -130,6 +131,14 @@ file must mean the same thing in every repo).
   bottom up (source facts first). A fact can also carry a check command
   (`--check "<cmd>" --expect "<output>"`) that re-confirms it automatically
   when its sources change.
+- **Moved sources:** when a source file or section moves word for word,
+  `kb move <old path>[#heading] <new path>` re-points every fact citing it.
+  It moves a source only where the new place has the recorded hash, so
+  nothing needs re-checking; the rest are listed. One call takes several
+  pairs (or `--pairs <file>`, old and new path per line, tab-separated).
+  If you also rewrote links to the moved files, add `--rewritten`: a source
+  whose text differs only by those paths gets its new hash, with no confirm;
+  any other difference stays suspect.
 - **Files ignored by git** (results, datasets) work as sources. In a git
   worktree, kb looks for them in the main checkout. A fact whose source is
   missing everywhere is shown as *unchecked*, never as clean.
@@ -176,6 +185,11 @@ files the script edited don't read as suspect. Sources it can't find or hash
 (a missing file, a missing or ambiguous section) keep their old hash and are
 listed. Sessions shouldn't use it: it skips
 the re-check that `kb confirm` stands for, so SKILL.md doesn't mention it.
+
+In such a copy, `copy = true` in `.kb.toml` (see Settings) makes every
+source file the copy leaves out read as unchecked. `kb check --json` prints
+every active fact's status and reasons (`{"kind", "detail"}`) for a script
+to read.
 
 ## After updating the plugin
 
